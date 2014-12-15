@@ -11,7 +11,6 @@ import scala.annotation.StaticAnnotation
   */
 
 /** TODO:
-  * 1. All methods exposed
   * 1. Default updates
   * 1. Custom method exposed
   * 1. Custom wrapper body
@@ -29,6 +28,7 @@ object MedusaMacro {
     def abort(msg: String) = {
       c.abort(c.enclosingPosition, s"Can't generate Medusa: $msg")
     }
+
     //println(c.macroApplication)
     //println(c.universe.showRaw(c.macroApplication))
     val (seedTypeName, wrapperTypeName) = c.macroApplication match {
@@ -39,7 +39,7 @@ object MedusaMacro {
               New(
                 AppliedTypeTree(
                   Ident(TypeName("medusa")),
-                  List(Ident(seedTypeName))
+                  List(seedTypeName)
                 )
               ),
               termNames.CONSTRUCTOR
@@ -67,8 +67,47 @@ object MedusaMacro {
       )
     }
 
-    val TypeName(seedName) = seedTypeName
-    val seedType = TypeName(seedName)
+    def getTypeNonBaseMethods(typeName: Tree) = {
+      val seedTpe = c.typeCheck(q"(7.asInstanceOf[$typeName])").tpe
+      val any = c.typeCheck(q"(7.asInstanceOf[Any])").tpe
+      val obj = c.typeCheck(q"(7.asInstanceOf[Object])").tpe
+      val baseMethods = Set(any, obj).flatMap(_.members.map(_.fullName).toSet)
+
+      val methods = seedTpe.members.collect {
+        case s: MethodSymbol if s.isPublic && !s.isAccessor && !s.isConstructor && !baseMethods.contains(s.fullName) => s
+      }
+      methods
+    }
+
+    val methods = getTypeNonBaseMethods(seedTypeName)
+    val setters = methods.filter(_.returnType == typeOf[Unit])
+    val getters = methods.filter(_.returnType != typeOf[Unit])
+    
+    val setterExprs = setters.map { s =>
+      if (s.paramss.isEmpty || s.paramss.head.isEmpty) {
+        q"""def ${s.name} = update(_.${s.name})"""
+      } else {
+        val names = s.paramss.head.zipWithIndex.map{ case (_, i) => newTermName("$" + i)}
+        val params = s.paramss.head.zip(names).map {case (p, n) => q"""$n: ${p.typeSignature}"""}
+
+        q"""
+          def ${s.name}(..$params): $wrapperTypeName = update(_.${s.name}(..$names))
+        """
+      }
+    }
+
+    val getterExprs = getters.map { g =>
+      if (g.paramss.isEmpty || g.paramss.head.isEmpty) {
+        q"""def ${g.name} = toMutable.${g.name}"""
+      } else {
+        val names = g.paramss.head.zipWithIndex.map{ case (_, i) => newTermName("$" + i)}
+        val params = g.paramss.head.zip(names).map {case (p, n) => q"""$n: ${p.typeSignature}"""}
+
+        q"""
+          def ${g.name}(..$params): ${g.returnType} = toMutable.${g.name}(..$names)
+        """
+      }
+    }
 
     val functype = AppliedTypeTree(
       Select(
@@ -76,7 +115,7 @@ object MedusaMacro {
         TypeName("Function1")
       ),
       List(
-        Ident(seedType),
+        seedTypeName,
         Ident(TypeName("Unit"))
       )
     )
@@ -84,14 +123,16 @@ object MedusaMacro {
     c.Expr[Any](
       q"""
         class $wrapperTypeName(
-          _seed: $seedType, val updates: List[$functype] = List()
+          _seed: $seedTypeName, val updates: List[$functype] = List()
         ) {
           private val seed = _seed
 
-          def create(upds: List[$functype]) = 
-            new $wrapperTypeName(seed, upds)
+          def update(f: $functype) = new $wrapperTypeName(seed, f :: updates)
           
-          def toMutant = 
+          ..$setterExprs
+          ..$getterExprs
+
+          lazy val toMutable = 
             updates.foldRight(seed) {
               case (f, s) =>
                 f(s)
@@ -105,5 +146,7 @@ object MedusaMacro {
       //}
     )
   }
+
+  
 
 }       
